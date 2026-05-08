@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3,4,5,6 VLLM_USE_MODELSCOPE=true vllm serve /mnt/sda/zhuangyungui/pretrained_models/Qwen3.5-27B --port 8004 --tensor-parallel-size 4 --max-model-len 262144 --reasoning-parser qwen3 
