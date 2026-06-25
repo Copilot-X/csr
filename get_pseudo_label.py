@@ -1,126 +1,218 @@
 import os
-import json
-import argparse
-import pandas as pd
-from tqdm import tqdm
+import base64
+import glob
+import csv
+import time
+import requests
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
-# # 环境变量设置
-os.environ['IMAGE_MAX_TOKEN_NUM'] = '2048'
-# # 建议在命令行通过 CUDA_VISIBLE_DEVICES 控制
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
-# 引入 TransformersEngine
-from swift import RequestConfig, InferRequest, TransformersEngine, BaseArguments
-from swift.template.vision_utils import load_image
+# ==========================================
+# 1. 配置参数与路径设置
+# ==========================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Qwen3-VL Molecule E-SMILES Batch Inference using PT (TransformersEngine)")
-    parser.add_argument("--model_path", type=str, default='/mnt/sda/zhuangyungui/pretrained_models/Qwen3-VL-8B-Instruct', help="Base model path")
-    parser.add_argument("--adapter_path", type=str, default='/mnt/sda/zhuangyungui/C/csr/output/qwen3-vl-8b/checkpoint-15000', help="Path to the adapter checkpoint")
-    # 修改默认测试集路径为你指定的路径
-    parser.add_argument("--target_dir", type=str, default="data/pic", help="Directory of images")
-    # 输出文件改为 csv
-    parser.add_argument("--output_file", type=str, default="submission/submission.csv", help="Path to save result csv")
-    # 转换为 PT 推理后，建议 max_batch_size 设为 1 保持稳定
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for TransformersEngine")
-    return parser.parse_args()
+MAX_WORKERS = 5      # 设置并发线程数
+MAX_RETRIES = 10      # 接口请求失败时的最大重试次数
+RETRY_DELAY = 15      # 重试前的等待时间（秒）
 
-def run_molecule_inference(args):
-    # 1. 初始化 TransformersEngine 引擎
-    print(f"🚀 Initializing TransformersEngine...")
-    model_id_or_path = args.model_path
+# 目录配置
+INPUT_DIR = "data/pic"                     # 赛方规定的图片输入目录
+CACHE_DIR = "cache_results"                # 缓存目录，用于断点续传
+OUTPUT_DIR = "submission"                  # 最终提交包的目录
+OUTPUT_CSV = os.path.join(OUTPUT_DIR, "submission.csv")
 
-    # 参考 PT 样例配置引擎
-    engine = TransformersEngine(
-        model_id_or_path,
-        adapters=[args.adapter_path],
-        max_batch_size=args.batch_size
-    )
+# ==========================================
+# 2. 辅助函数：图片转 Base64
+# ==========================================
+def encode_image_to_base64(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
-    # 分子式通常较长，建议 max_tokens 设大一点（比如 4096），temperature 保持 0 追求确定性
-    # 额外参考样例加入 num_beams 参数（若有需要可自行调整，这里保留你原本的低温度确定性策略）
-    # request_config = RequestConfig(max_tokens=512, temperature=0)
-    request_config = RequestConfig()
-
-    # 2. 扫描图片
-    all_tasks = []
-    for root, _, files in os.walk(args.target_dir):
-        files = sorted(files)
-        for file in files:
-            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                # 注意：这里直接保留完整文件名 file，不再去后缀
-                full_path = os.path.join(root, file)
-                all_tasks.append((file, full_path))
-
-    total_count = len(all_tasks)
-    print(f"🔍 Found {total_count} images in {args.target_dir}. Starting inference...")
-
-    results = []
-
-    # 3. 批量推理（保持原有逻辑骨架，兼容 args.batch_size 块处理）
-    for i in tqdm(range(0, total_count, args.batch_size), desc="Processing Batches"):
-        if i > 10:
-            break
-        batch = all_tasks[i : i + args.batch_size]
-        
-        infer_reqs = []
-        valid_files = []
-
-        for file_name, img_path in batch:
-            try:
-                # Prompt 必须与 SFT 构建阶段严格一致
-                messages = [{"role": "user", "content": """<image>请识别图中的分子，并以Extended-SMILES的形式输出预测结果。
-                        
-### Extended-SMILES (E-SMILES) 规范要求（必须严格遵守）：
-基本格式必须为：`SMILES<sep>EXTENSION`
-1. **SMILES**：前半部分是与 RDKit 兼容的标准 SMILES 字符串。
-2. **<sep>**：作为特殊分隔符，将常规 SMILES 与扩展描述分开（若无扩展结构，视情况保留或省略均可，但建议统一格式）。
-3. **EXTENSION**：后半部分使用类似 XML 的特殊标记来描述复杂结构（如马库什结构等）：
-   - 取代基/缩写基团: 格式为 `<a> [ATOM_INDEX]: [GROUP_NAME] </a>`。例如：`<a>0:R[1]</a>` 或 `<a>12:Ph</a>`。
-   - 位置不确定的环取代物: 格式为 `<r> [RING_INDEX]: [GROUP_NAME] </r>`。
-   - 抽象环: 格式为 `<c> [CIRCLE_INDEX]: [CIRCLE_NAME] </c>`。
-   - 连接点: 使用特殊标记 `<dum>`，如 `<a>0:<dum></a>`。   
-
-最终输出该分子的 Extended-SMILES 字符串。                
-"""}]
-                infer_reqs.append(InferRequest(messages=messages, images=[img_path]))
-                valid_files.append(file_name)
-            except Exception as e:
-                print(f"❌ Error loading {img_path}: {e}")
-                # 赛题规定：报错或放弃的留空
-                results.append({"file_name": file_name, "e_smiles": ""})
-
-        if infer_reqs:
-            try:
-                # 使用 TransformersEngine 进行推理
-                resp_list = engine.infer(infer_reqs, request_config)
-                
-                for file_name, resp in zip(valid_files, resp_list):
-                    content = resp.choices[0].message.content
-                    
-                    # 兼容可能带有 reasoning 思维链的模型
-                    if "</think>" in content:
-                        content = content.split("</think>")[-1]
-                    else:
-                        content = content
-                        
-                    results.append({"file_name": file_name, "e_smiles": content})
-            except Exception as e:
-                print(f"⚠️ Batch inference error: {e}")
-                for file_name in valid_files:
-                    # 批次推理崩溃时，该批次全部填空字符串，保证行数不丢失
-                    results.append({"file_name": file_name, "e_smiles": ""})
-
-    # 4. 保存为 CSV
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
+# ==========================================
+# 3. 单张图片处理函数 (调用 DP Tech 接口 + 重试机制)
+# ==========================================
+def process_single_image(image_path, cache_path):
+    base64_image = encode_image_to_base64(image_path)
+    file_name = os.path.basename(image_path)
+    print(f"🚀 线程启动: 正在处理 {file_name} ...")
     
-    # 使用 Pandas 导出标准 CSV，表头为 file_name, e_smiles
-    df = pd.DataFrame(results)
-    df.to_csv(args.output_file, index=False, encoding='utf-8')
+    url = "https://ocsr.dp.tech/mol/img2mol"
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "referrer": "https://ocsr.dp.tech/"
+    }
+    payload = {
+        "base64_img": base64_image
+    }
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 发起 POST 请求，增加 timeout 防止长时间挂起
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
 
-    print(f"✅ Finished! Saved {len(results)} results to {args.output_file}")
-    print("💡 温馨提示：提交前请记得将生成的 csv 与 meta.md 一同打包为 zip。")
+            if response.status_code == 500:
+                print(f"🚨 拦截到 500 Internal Server Error ({file_name})，服务端处理异常，已跳出重试！")
+                return False
+
+            response.raise_for_status()  # 检查 HTTP 状态码是否为 200
+            
+            result = response.json()
+            
+            # 判断接口返回的业务状态码 code 是否为 0 (0通常代表成功)
+            if result.get("code") == 0:
+                e_smiles = result.get("data", [])[0]['caption']
+                score = result.get("data", [])[0]['score']
+                
+                # 写入 txt 缓存文件
+                with open(cache_path, 'w', encoding='utf-8') as f:
+                    f.write(e_smiles + "\t" + str(score))
+                    
+                print(f"✅ 成功: {file_name} -> 缓存完成")
+                return True
+            else:
+                msg = result.get("msg", "未知错误")
+                print(f"⚠️ 接口返回业务错误 ({file_name}): {msg}")
+                # 遇到业务报错同样进入下方的重试逻辑（防并发误杀）
+                
+        except Exception as e:
+            print(f"❌ 请求异常 ({file_name}) - 第 {attempt + 1} 次尝试失败: {e}")
+            
+        # 如果还没到最大重试次数，则等待一段时间后重试
+        if attempt < MAX_RETRIES - 1:
+            print(f"⏳ 等待 {RETRY_DELAY} 秒后对 {file_name} 进行第 {attempt + 2} 次重试...")
+            time.sleep(RETRY_DELAY)
+            
+    print(f"🚨 彻底失败: {file_name} 已超过最大重试次数 ({MAX_RETRIES}次)。")
+    return False
+
+# ==========================================
+# 4. 汇总生成 CSV 及 Zip 打包
+# ==========================================
+def generate_submission(image_files):
+    print(f"\n" + "="*50)
+    print(f"📄 开始生成最终的 submission 文件及压缩包 ...")
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # 1. 写入 CSV
+    with open(OUTPUT_CSV, mode='w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['file_name', 'e_smiles']) # 写入表头
+        
+        for img_path in image_files:
+            file_name = os.path.basename(img_path)
+            base_name = os.path.splitext(file_name)[0]
+            cache_path = os.path.join(CACHE_DIR, f"{base_name}.txt")
+            
+            e_smiles = ""
+            if os.path.exists(cache_path):
+                with open(cache_path, 'r', encoding='utf-8') as cf:
+                    e_smiles = cf.read().strip()
+            
+            writer.writerow([file_name, e_smiles])
+            
+    print(f"✅ CSV 结果已保存至: {OUTPUT_CSV}")
+
+    # # 2. 生成预置的 meta.md（防止忘记写导致不符合赛方格式）
+    # meta_path = os.path.join(OUTPUT_DIR, "meta.md")
+    # if not os.path.exists(meta_path):
+    #     with open(meta_path, 'w', encoding='utf-8') as f:
+    #         f.write("# Meta Data\n\n请在此处补充比赛要求的 meta 信息（如果不需要可直接删除此段）。")
+    #     print(f"✅ 已自动生成占位符文件: {meta_path}")
+
+    # 3. 将整个 OUTPUT_DIR 打包为 zip
+    zip_filename = "submission"  # shutil 会自动追加 .zip 后缀
+    shutil.make_archive(zip_filename, 'zip', OUTPUT_DIR)
+    print(f"📦 已将 {OUTPUT_DIR} 目录完整打包为: {zip_filename}.zip")
+
+# ==========================================
+# 5. 主执行循环 (多线程并发控制)
+# ==========================================
+def main():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    if not os.path.exists(INPUT_DIR):
+        print(f"错误：输入文件夹 '{INPUT_DIR}' 不存在。请确保图片放在对应的目录。")
+        return
+
+    # 获取所有图片文件
+    image_extensions = ('*.png', '*.jpg', '*.jpeg')
+    image_files = []
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(INPUT_DIR, ext)))
+        image_files.extend(glob.glob(os.path.join(INPUT_DIR, ext.upper()))) 
+    
+    image_files = sorted(list(set(image_files)))
+    
+    if not image_files:
+        print(f"在 '{INPUT_DIR}' 中没有找到图片文件。")
+        return
+        
+    print(f"找到 {len(image_files)} 张图片，开始多线程批量处理 (最大线程数: {MAX_WORKERS})...\n" + "-"*50)
+    
+    success_count = 0
+    failed_files = [] # 追踪所有失败的文件名
+    
+    # 阶段一：任务预过滤（断点续传拦截）
+    tasks_to_run = []
+    for idx, img_path in enumerate(image_files):
+        # if idx < 652:
+        #     continue
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        cache_path = os.path.join(CACHE_DIR, f"{base_name}.txt")
+        
+        if os.path.exists(cache_path):
+            print(f"⏩ 跳过: {base_name}.txt 缓存已存在。")
+            success_count += 1
+        else:
+            tasks_to_run.append((img_path, cache_path))
+            
+    print(f"\n待处理的新任务数: {len(tasks_to_run)}")
+    print("-" * 50)
+    
+    # 阶段二：提交给线程池
+    if tasks_to_run:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_img = {
+                executor.submit(process_single_image, img_path, cache_path): img_path 
+                for img_path, cache_path in tasks_to_run
+            }
+            
+            for future in as_completed(future_to_img):
+                img_path = future_to_img[future]
+                file_name = os.path.basename(img_path)
+                try:
+                    is_success = future.result()
+                    if is_success:
+                        success_count += 1
+                    else:
+                        failed_files.append(file_name) # 函数内用尽了重试次数，依然失败
+                except Exception as exc:
+                    print(f"❌ 线程池执行遇到严重异常 ({file_name}): {exc}")
+                    failed_files.append(file_name) # 捕获意外的崩溃
+
+    # 阶段三：合并结果并打包
+    generate_submission(image_files)
+
+    # 阶段四：统计与总结
+    print("-" * 50)
+    print(f"🎉 处理完成！共成功处理并合成了 {success_count} / {len(image_files)} 个结果。")
+    
+    # 输出异常统计列表
+    if failed_files:
+        print(f"\n⚠️ 警告：有 {len(failed_files)} 张图片未能成功识别！清单如下：")
+        for bad_file in failed_files:
+            print(f"  - {bad_file}")
+    else:
+        print(f"\n🌟 完美！所有新提交的图片都已100%成功识别。")
+    
+    print(f"\n💡 最终检查提醒：")
+    print(f"1. 如需补充或修改 meta.md 内容，请进入 {OUTPUT_DIR} 修改后，手动重新压缩。")
+    print(f"2. 如果不需要修改 meta 信息，直接提交当前目录下的 submission.zip 即可！")
 
 if __name__ == "__main__":
-    args = parse_args()
-    run_molecule_inference(args)
+    main()
